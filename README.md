@@ -1,2 +1,2 @@
 # Deep_color_propogation
-Coursework about. deep color propagation
+Coursework about deep color propagation
