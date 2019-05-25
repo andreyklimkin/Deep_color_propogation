@@ -19,7 +19,11 @@ class NewSepConv(nn.Module):
         b, c, H, W = imgs.size()
         _, s, _, _ = vers.size()
         
-        all_kernels = vers.permute(0,2,3,1).contiguous().view(b, H, W, s, 1) @ hors.permute(0,2,3,1).contiguous().view(b, H, W, 1, s)
+        all_kernels = vers.permute(0,2,3,1).contiguous().view(b, H, W, s, 1) @ hors.permute(0,2,3,1).contiguous().view(b,
+                                                                                                                       H,
+                                                                                                                       W,
+                                                                                                                       1, 
+                                                                                                                       s)
         all_kernels = all_kernels.view(b, 1, H, W, s, s)
         imgs = torch.nn.ReplicationPad2d([8,8,8,8]) (imgs)
         all_patches = []
@@ -141,12 +145,38 @@ class ResNet101Extractor:
         return (x_fine[0].cpu().detach().numpy().transpose(1, 2, 0).astype(np.double),
                 x_coarse[0].cpu().detach().numpy().transpose(1, 2, 0).astype(np.double))  
 
-class GlobalTransferer:
+from resent import resnet101
+import torch.nn as nn
+import torch
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+
+import numpy as np
+import torch.nn.functional as F
+from tqdm import tqdm
+class ResNet101Extractor:
+    def __init__(self):
+        self.net = resnet101(pretrained=True).cuda()
+        self.net.eval()
+    
+    def get_features(self, img):
+        tensor = torch.Tensor(img.transpose(0, 3, 1, 2)).cuda()
+        x = self.net.conv1(tensor)
+        x = self.net.bn1(x)
+        x = self.net.relu(x)
+        x_fine = self.net.layer1(x)
+        x = self.net.layer2(x_fine)
+        x_coarse = self.net.layer3(x)
+        return (x_fine.cpu().detach().numpy().transpose(0,   2, 3, 1).astype(np.double),
+                x_coarse.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double))  
+
+class GlobalTransferer(nn.Module):
     def __init__(self, downscale_coef=4):
+        super().__init__()
         self.downscale_coef = downscale_coef
         self.feature_extractor_net = ResNet101Extractor()
     
-    def get_coarse_match(self, F_G1, F_Gk):
+    def get_coarse_match_old(self, F_G1, F_Gk):
         closest = torch.zeros(F_G1.shape[0], F_G1.shape[1], 2)
         F_G1_tensor = torch.Tensor(F_G1.transpose(2, 0, 1))[None, ...]
         F_Gk_tensor = torch.Tensor(F_Gk)
@@ -167,46 +197,80 @@ class GlobalTransferer:
             closest[i, :, 1] = mse_row_closest_indxs % F_G1.shape[1]
         return closest.cpu().detach().numpy().astype(np.uint8)
     
-    def get_fine_match(self, F_G1, F_Gk, coarse_match):
-        H, W = F_Gk.shape[:2]
+    def get_coarse_match_new(self, F_G1, F_Gk):
+        H, W, K = F_G1.shape[-3:]
+        closest = torch.zeros(len(F_G1), H, W, 2).cuda()
+        F_G1_tensor = torch.Tensor(F_G1).cuda()
+        F_Gk_tensor = torch.Tensor(F_Gk).cuda()
+
+        for b in range(len(F_G1)):
+
+            weights = F_G1_tensor[b].reshape(H * W, K, 1, 1)
+            input_tensor = F_Gk_tensor[b].permute(2, 0, 1).reshape(1, K, H, W)
+
+
+            f2_g1 = torch.sum(F_G1_tensor[b] ** 2, -1)[None, None, ...].reshape(H * W, 1, 1)
+            f2_gk = torch.sum(F_Gk_tensor[b] ** 2, -1)[None, None, ...]
+            F_gk_g1 = F.conv2d(input_tensor, weights)[0]
+
+            pathces_mse = (f2_gk + f2_g1 - 2 * F_gk_g1)[0]
+            closes_patches_indxs = torch.argmin(pathces_mse, 0)
+            closest[b, ..., 0] = closes_patches_indxs // W
+            closest[b, ..., 1] = closes_patches_indxs % W
+
+        return closest.cpu().detach().numpy().astype(np.uint8)
+
+    
+    def get_fine_match_new(self, F_G1_batch, F_Gk_batch, coarse_match_batch):
         downscale_coef = self.downscale_coef
-        result_match = np.zeros((H, W, 2))
-        
-        for I in range(0, H):
-            for J in range(0, W):
-                min_mse_IJ = 1e9
-                IJ_closest = (I, J)
-                c_i = I // downscale_coef
-                c_j = J // downscale_coef
-                shift_i = 1
-                shift_j = 1
-                h_bound = min(H // downscale_coef, c_i + shift_i + 1)
-                w_bound = min(W // downscale_coef, c_j + shift_j + 1)
-                for i in range(max(0, c_i - shift_i), h_bound):
-                    for j in range(max(0, c_j - shift_j), min(W // downscale_coef, c_j + shift_j + 1)):
-                        coarse_i, coarse_j = coarse_match[i, j, :]
+        batch_size, H, W = F_Gk_batch.shape[:3]
+
+        result_match = np.zeros((batch_size, H, W, 2))
+        for batch_element in range(batch_size):
+            F_G1, F_Gk, coarse_match = F_G1_batch[batch_element], 
+            F_Gk_batch[batch_element], coarse_match_batch[batch_element]
+            for I in range(0, H // downscale_coef):
+                for J in range(0, W // downscale_coef):
+                    Fk_ij_features = F_Gk[downscale_coef * I : downscale_coef * (I + 1),
+                                          downscale_coef * J : downscale_coef * (J + 1), :].reshape(downscale_coef ** 2, 
+                                                                                                    1, -1)
+
+                    t = max(I - 1, 0)
+                    b = min(I + 2, H // downscale_coef)
+                    l = max(J - 1, 0)
+                    r = min(J + 2, W // downscale_coef)
+                    closest_IJ_indeces = coarse_match[t : b, l : r]
+                    closest_IJ_indeces = closest_IJ_indeces.transpose(2, 0, 1).reshape(2, (b - t) * (r - l), 
+                                                                                       1).astype(np.int)
 
 
-                        H_bound = min(H, (coarse_i + 1) * downscale_coef)
-                        W_bound = min(W, (coarse_j + 1) * downscale_coef)
-                        row_size = W_bound - coarse_j * downscale_coef
-                        col_size = H_bound - coarse_i * downscale_coef
-                        
-                        candidates_features = F_G1[coarse_i * downscale_coef: H_bound,
-                                                   coarse_j * downscale_coef: W_bound,
-                                                   :].reshape(row_size * col_size, -1) 
+                    row_indxs_shifts = np.repeat(np.arange(downscale_coef), axis=0, 
+                                                 repeats=downscale_coef).reshape(1,downscale_coef ** 2)
+                    col_indxs_shifts = np.repeat(np.arange(downscale_coef).reshape(1,downscale_coef), axis=0, 
+                                                 repeats=downscale_coef).reshape(-1).reshape(1,  downscale_coef ** 2)
+
+                    res_indxs = np.zeros((2, (b - t) * (r - l)
+                                          , downscale_coef ** 2))
+
+                    res_indxs[0] = closest_IJ_indeces[0] * downscale_coef + row_indxs_shifts
+                    res_indxs[1] = closest_IJ_indeces[1] * downscale_coef + col_indxs_shifts
+
+                    flatten_res_indxs = (res_indxs[0].reshape(-1).astype(np.int), res_indxs[1].reshape(-1).astype(np.int))
 
 
-                        closest = np.argmin(((candidates_features -  F_Gk[I,  J, :]) ** 2).sum(-1))
-                        closest_mse = ((candidates_features[closest] -  F_Gk[I,  J, :]) ** 2).sum(-1)
 
-                        if closest_mse < min_mse_IJ:
-                            row_size = W_bound - coarse_j * downscale_coef
-                            min_mse_IJ = closest_mse
-                            IJ_closest = (coarse_i * downscale_coef + closest // row_size, 
-                                          coarse_j * downscale_coef + closest % row_size)
-                    result_match[I, J] = IJ_closest
-        return result_match
+                    F1_ij_candidates = F_G1[flatten_res_indxs].reshape(len(flatten_res_indxs[0]),-1)
+
+                    feature_distance = np.sum((F1_ij_candidates - Fk_ij_features) ** 2, -1)
+                    closest_features_indeces = np.argmin(feature_distance, -1)
+
+                    result_IJ_indeces = np.array((flatten_res_indxs[0][closest_features_indeces],  
+                                                  flatten_res_indxs[1][closest_features_indeces])).reshape(2,
+                                                                                                           downscale_coef,
+                                                                                                           downscale_coef)
+                    result_match[batch_element, downscale_coef * I : downscale_coef * (I + 1),
+                                 downscale_coef * J : downscale_coef * (J + 1)] = result_IJ_indeces.transpose(1, 2, 0)
+            return result_match
 
     def copy_colors(self, rgb_I0, gray_Ik, closest_idxs):
         from skimage.color import rgb2lab, lab2rgb
@@ -223,9 +287,12 @@ class GlobalTransferer:
     def forward(self, G_1, G_k, I_1):
         F_g1_fine, F_g1_coarse = self.feature_extractor_net.get_features(G_1)
         F_gk_fine, F_gk_coarse = self.feature_extractor_net.get_features(G_k)
+        closest_coarse = self.get_coarse_match_new(F_g1_coarse, F_gk_coarse)
+        closest_fine = self.get_fine_match_new(F_g1_fine, F_gk_fine, closest_coarse)
         
-        closest_coarse = self.get_coarse_match(F_g1_coarse, F_gk_coarse)
-        closest_fine = self.get_fine_match(F_g1_fine, F_gk_fine, closest_coarse)
-        I_k = self.copy_colors(I_1, G_k, closest_fine.astype(np.uint8))
-        
-        return I_k
+        result = []
+        for i in range(len(closest_fine)): 
+            I_k = self.copy_colors(I_1[i], G_k[i], closest_fine[i].astype(np.uint8))
+            result.append(I_k)
+        return np.array(result)
+    

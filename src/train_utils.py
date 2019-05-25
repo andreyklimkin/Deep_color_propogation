@@ -15,15 +15,11 @@ def draw_scalar_value(writer, scalar_folder, tag, scalar_value, iteration):
                        },
                        iteration)
     
-# def draw_photos(writer, batch, iteration, tag="train"):
-#     for i in range(len(batch[0])):
-#         if (tag == "train") or ("val" in tag):
-#             original_imgs, corrupted_imgs, reconstructed_imgs = batch
-#             writer.add_image("{}_examples/example{}".format(tag, i),
-#                              np.concatenate((img_as_ubyte(original_imgs[i]), img_as_ubyte(corrupted_imgs[i]),
-#                                              img_as_ubyte(reconstructed_imgs[i])), 1).transpose(2, 0, 1), iteration)
-#         elif tag == "test":
-#             original_imgs, reconstructed_imgs = batch
-#             writer.add_image("{}_examples/example{}".format(tag, i),
-#                              np.concatenate((img_as_ubyte(original_imgs[i]),
-#                                              img_as_ubyte(reconstructed_imgs[i])), 1).transpose(2, 0, 1), iteration)
+def draw_images(writer, gt_images, result_images, iteration, tag="train"):
+    for i in range(len(gt_images)):
+        if (tag == "train") or ("val" in tag):
+            writer.add_image("{}_examples/example{}".format(tag, i),
+                             np.concatenate((img_as_ubyte(gt_images[i].transpose(2, 0, 1)), 
+                                             img_as_ubyte(result_images[i]).transpose(2, 0, 1)), 2), iteration)
+                                            
+            
