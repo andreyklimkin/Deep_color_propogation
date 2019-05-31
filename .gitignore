@@ -5,3 +5,8 @@ Articles/
 useful_links
 experiments
 *ipynb_checkpoints
+.DS_Store
+.gitignore.swp
+best_models/
+test_inference_speed.ipynb
+test_model.ipynb
