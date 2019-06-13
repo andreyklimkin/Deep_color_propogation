@@ -13,6 +13,7 @@ from skimage.transform import resize
 from skimage import io, img_as_float
 from skimage.color import rgb2lab, lab2rgb
 from tqdm import tqdm
+from torchvision.models import mobilenet_v2
 
 
 class NewSepConv(nn.Module):
@@ -113,6 +114,21 @@ class LocalTransferNet(nn.Module):
     
     
 
+# class RefinementNet(nn.Module):
+#     def __init__(self, input_channels=[9, 64, 64, 64, 64, 64], output_channel=[64, 64, 64, 64, 64, 2], 
+#                  dilations=[1, 2, 4, 1, 1, 1]):
+#         super().__init__()
+#         self.conv_layers = nn.Sequential()
+#         for i in range(len(input_channels)):
+#             self.conv_layers.add_module("conv_%d"%i, nn.Conv2d(input_channels[i], 
+#                                                                output_channel[i], 3, 
+#                                                                padding=dilations[i], dilation=dilations[i]))
+#             if i != len(input_channels) - 1:
+#                 self.conv_layers.add_module("nonlinearity_%d" % i,  nn.ReLU())
+
+#     def forward(self, x):
+#         return self.conv_layers(x)
+
 class RefinementNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -150,29 +166,64 @@ class RefinementNet(nn.Module):
 #         return (x_fine[0].cpu().detach().numpy().transpose(1, 2, 0).astype(np.double),
 #                 x_coarse[0].cpu().detach().numpy().transpose(1, 2, 0).astype(np.double))  
 
-class ResNet101Extractor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = resnet101(pretrained=True).double()
+class FeatureExtractor:
+    def __init__(self, net_type='resnet101', fine_bound_mobilenet="resnet101"):
+        if net_type == "resnet101":
+            self.net = resnet101(pretrained=True).cuda()
+        elif net_type == "resnet101_segmentation":
+            self.net = fcn_resnet101(pretrained=True, progress=True, num_classes=21, aux_loss=None).cuda()
+            self.net.backbone.conv1.stride = (1, 1)
+            self.net.backbone.layer3[0].downsample[0].stride=(2, 2)
+            self.net.backbone.layer3[0].conv2.stride=(2, 2)
+        elif net_type == "mobilenet":
+            self.net = mobilenet_v2(pretrained=True).cuda()
+            self.net.features[0][0].stride = (1, 1)
+            self.net.features[2].conv[1][0].stride = (1, 1)
+            self.fine_bound = fine_bound_mobilenet
+            self.coarse_layer = 8
         self.net.eval()
+        self.net_type = net_type
     
-    def forward(self, tensor):
-        #tensor = torch.Tensor(img.transpose(0, 3, 1, 2)).cuda()
-        x = self.net.conv1(tensor)
-        x = self.net.bn1(x)
-        x = self.net.relu(x)
-        x_fine = self.net.layer1(x)
-        x = self.net.layer2(x_fine)
-        x_coarse = self.net.layer3(x)
-        return (x_fine.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double),
-                x_coarse.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double))
-
+    def get_features(self, img):
+        tensor = torch.Tensor(img.transpose(0, 3, 1, 2)).cuda()
+        if self.net_type == "resnet101":
+            #print(tensor.shape)
+            x = self.net.conv1(tensor)
+            #print(x.shape)
+            x = self.net.bn1(x)
+            x = self.net.relu(x)
+            x_fine = self.net.layer1(x)
+            #print(x_fine.shape)
+            x = self.net.layer2(x_fine)
+            x_coarse = self.net.layer3(x)
+            return (x_fine.cpu().detach().numpy().transpose(0,   2, 3, 1).astype(np.double),
+                    x_coarse.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double))  
+        elif self.net_type == "resnet101_segmentation":
+            #print(tensor.shape)
+            x = self.net.backbone.conv1(tensor)
+            x = self.net.backbone.bn1(x)
+            x = self.net.backbone.relu(x)
+            x_fine = self.net.backbone.layer1(x)
+            print(x_fine.shape)
+            x = self.net.backbone.layer2(x_fine)
+            print(x.shape)
+            x_fine = x_fine.detach().cpu()
+            x_coarse =  self.net.backbone.layer3(x)
+            print(x_coarse.shape)
+            return (x_fine.cpu().detach().numpy().transpose(0,   2, 3, 1).astype(np.double),
+                    x_coarse.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double)) 
+        elif self.net_type == "mobilenet":
+            x_fine = self.net.features[0:self.fine_bound](tensor)
+            x_coarse = self.net.features[self.fine_bound:self.coarse_layer](x_fine)
+            return (x_fine.cpu().detach().numpy().transpose(0,   2, 3, 1).astype(np.double),
+                    x_coarse.cpu().detach().numpy().transpose(0, 2, 3, 1).astype(np.double)) 
+            
 
 class GlobalTransferer(nn.Module):
-    def __init__(self, downscale_coef=4):
+    def __init__(self, net_type="resnet101", fine_bound_mobilenet=3, downscale_coef=4):
         super().__init__()
         self.downscale_coef = downscale_coef
-        self.feature_extractor_net = ResNet101Extractor().cuda()
+        self.feature_extractor_net = FeatureExtractor(net_type, fine_bound_mobilenet=fine_bound_mobilenet)
     
     def get_coarse_match_old(self, F_G1, F_Gk):
         closest = torch.zeros(F_G1.shape[0], F_G1.shape[1], 2)
@@ -195,23 +246,20 @@ class GlobalTransferer(nn.Module):
             closest[i, :, 1] = mse_row_closest_indxs % F_G1.shape[1]
         return closest.cpu().detach().numpy().astype(np.uint8)
     
-    def get_coarse_match_new(self, F_G1_batch, F_Gk_batch):
-        B, H, W, K = F_G1_batch.shape
-        closest = torch.zeros(B, H, W, 2).cuda()
-        
-        F_G1_batch_tensor = torch.Tensor(F_G1_batch).cuda()
-        F_Gk_batch_tensor = torch.Tensor(F_Gk_batch).cuda()
+    def get_coarse_match_new(self, F_G1, F_Gk):
+        H, W, K = F_G1.shape[-3:]
+        closest = torch.zeros(len(F_G1), H, W, 2).cuda()
+        F_G1_tensor = torch.Tensor(F_G1).cuda()
+        F_Gk_tensor = torch.Tensor(F_Gk).cuda()
 
-        for b in range(B):
-            F_G1_tensor = F_G1_batch_tensor[b]
-            F_Gk_tensor = F_Gk_batch_tensor[b]
-            
-            weights = F_G1_tensor.reshape(H * W, K, 1, 1)
-            input_tensor = F_Gk_tensor.permute(2, 0, 1).reshape(1, K, H, W)
+        for b in range(len(F_G1)):
+
+            weights = F_G1_tensor[b].reshape(H * W, K, 1, 1)
+            input_tensor = F_Gk_tensor[b].permute(2, 0, 1).reshape(1, K, H, W)
 
 
-            f2_g1 = torch.sum(F_G1_tensor ** 2, -1)[None, None, ...].reshape(H * W, 1, 1)
-            f2_gk = torch.sum(F_Gk_tensor ** 2, -1)[None, None, ...]
+            f2_g1 = torch.sum(F_G1_tensor[b] ** 2, -1)[None, None, ...].reshape(H * W, 1, 1)
+            f2_gk = torch.sum(F_Gk_tensor[b] ** 2, -1)[None, None, ...]
             F_gk_g1 = F.conv2d(input_tensor, weights)[0]
 
             pathces_mse = (f2_gk + f2_g1 - 2 * F_gk_g1)[0]
@@ -220,7 +268,6 @@ class GlobalTransferer(nn.Module):
             closest[b, ..., 1] = closes_patches_indxs % W
 
         return closest.cpu().detach().numpy().astype(np.uint8)
-
     
     def get_fine_match_new(self, F_G1_batch, F_Gk_batch, coarse_match_batch):
         downscale_coef = self.downscale_coef
@@ -273,25 +320,23 @@ class GlobalTransferer(nn.Module):
         return result_match
 
     def copy_colors(self, rgb_I0, gray_Ik, closest_idxs):
-        
+        from skimage.color import rgb2lab, lab2rgb
         result = np.zeros_like(rgb_I0)
         lab_I0 = rgb2lab(rgb_I0)
         lab_Ik = rgb2lab(gray_Ik)
+        
         
         for i in range(rgb_I0.shape[0]):
             for j in range(rgb_I0.shape[1]):
                 lab_Ik[i, j, 1:] = lab_I0[closest_idxs[i, j, 0], closest_idxs[i, j, 1], 1:]
         return lab2rgb(lab_Ik)
     
-    def get_features(self, img):
-        tensor = torch.tensor(img.transpose(0, 3, 1, 2), dtype=torch.double, requires_grad=False).cuda()
-        return self.feature_extractor_net(tensor)
-    
     def forward(self, G_1, G_k, I_1):
-        F_g1_fine, F_g1_coarse = self.get_features(G_1)
-        F_gk_fine, F_gk_coarse = self.get_features(G_k)
+        F_g1_fine, F_g1_coarse = self.feature_extractor_net.get_features(G_1)
+        F_gk_fine, F_gk_coarse = self.feature_extractor_net.get_features(G_k)
         closest_coarse = self.get_coarse_match_new(F_g1_coarse, F_gk_coarse)
         closest_fine = self.get_fine_match_new(F_g1_fine, F_gk_fine, closest_coarse)
+        
         result = []
         for i in range(len(closest_fine)): 
             I_k = self.copy_colors(I_1[i], G_k[i], closest_fine[i].astype(np.uint8))

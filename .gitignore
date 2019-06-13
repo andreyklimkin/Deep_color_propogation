@@ -18,3 +18,6 @@ video_examples/*
 core
 for_presa*
 test_batch*
+backup_models/*
+pytorch_spynet/
+optical_flow_inference.ipynb
